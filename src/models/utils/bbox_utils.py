@@ -405,6 +405,29 @@ def thr_select_policy(scores, given_gt_thr=0.5, percent=35, vaild_len=100, polic
 
 
 def filter_invalid(bbox, label=None, score=None, mask=None, thr=0.0, min_size=0):
+    """Filter bounding boxes by confidence score threshold and minimum size.
+
+    Core primitive used by the two-stage pseudo-label quality filter:
+      - Stage 1 (τ_l, low-quality): called with ``thr=tau_l`` to drop
+        obviously noisy detections. At ``tau_l=0.0`` (default) this is a
+        no-op.
+      - Stage 2/3 (τ_h, high-quality): called with ``thr=tau_h`` (or its
+        negation for the ≥ semantics) to keep only high-confidence boxes as
+        supervised pseudo-label targets.
+
+    Args:
+        bbox: Bounding box tensor of shape (N, ≥4).
+        label: Class label tensor of shape (N,), optional.
+        score: Confidence score tensor of shape (N,), optional.
+            Pass ``-score`` together with ``thr=-tau_h`` to implement the
+            ``score >= tau_h`` (≥) semantics on top of the strict ``>`` check.
+        mask: BitmapMasks object, optional.
+        thr (float): Score threshold.  Boxes with ``score > thr`` are kept.
+        min_size (float): Minimum box side length (width and height).
+
+    Returns:
+        tuple: ``(bbox, label, mask)`` with invalid boxes removed.
+    """
     if score is not None:
         valid = score > thr
         bbox = bbox[valid]

@@ -39,6 +39,57 @@ DEFAULT_CUTMIX_ITER = 10000  # Default CutMix activation iteration count
 DEFAULT_CLS_MAP_VERSION = 'dota1'  # Default class mapping version
 DEFAULT_PERCENT_VERSION = '1ins'  # Default data percentage version
 
+# ── Default pseudo-label quality thresholds ──────────────────────────────────
+# tau_h (high-quality): only teacher predictions with score >= tau_h are used
+# as supervised pseudo-labels for the student.  Configurable via
+# train_cfg.pseudo_label_real_score_thr.
+DEFAULT_TAU_H = 0.9  # high-quality threshold default
+# tau_l (low-quality): coarse initial pre-filter applied before tau_h.
+# At 0.0 it is effectively disabled; raise to ~0.2–0.4 to skip noisy
+# low-confidence detections early.  Configurable via
+# train_cfg.pseudo_label_initial_score_thr.
+DEFAULT_TAU_L = 0.0  # low-quality threshold default
+
+
+def compute_quality_thresholds(train_cfg):
+    """Return the two pseudo-label quality thresholds (tau_h, tau_l).
+
+    Both thresholds are **fixed constants** read from the training config.
+    They do not change during training.
+
+    Args:
+        train_cfg: Training configuration object (mmcv ConfigDict or similar).
+            Expected attributes:
+              - pseudo_label_real_score_thr (float): high-quality threshold τ_h.
+                Only teacher predictions with score >= τ_h become supervised
+                pseudo-label targets.  Default: 0.9.
+              - pseudo_label_initial_score_thr (float): low-quality threshold
+                τ_l. Coarse pre-filter applied before τ_h.  At 0.0 it is
+                effectively disabled.  Default: 0.0.
+
+    Returns:
+        tuple[float, float]: ``(tau_h, tau_l)`` where ``tau_h >= tau_l >= 0``.
+
+    Raises:
+        ValueError: if tau_h or tau_l is outside [0, 1] or if tau_l > tau_h.
+    """
+    tau_h = getattr(train_cfg, 'pseudo_label_real_score_thr', DEFAULT_TAU_H)
+    tau_l = getattr(train_cfg, 'pseudo_label_initial_score_thr', DEFAULT_TAU_L)
+
+    if not (0.0 <= tau_l <= 1.0):
+        raise ValueError(
+            f"pseudo_label_initial_score_thr (tau_l) must be in [0, 1], got {tau_l}"
+        )
+    if not (0.0 <= tau_h <= 1.0):
+        raise ValueError(
+            f"pseudo_label_real_score_thr (tau_h) must be in [0, 1], got {tau_h}"
+        )
+    if tau_l > tau_h:
+        raise ValueError(
+            f"tau_l ({tau_l}) must be <= tau_h ({tau_h})"
+        )
+    return tau_h, tau_l
+
 
 def save_json(save_path, data):
     """
@@ -939,10 +990,19 @@ class DML_ALOD(MultiSteamDetector):
         teacher_info["det_labels_all"] = proposal_labels
 
         # 6. Pseudo-label filtering (based on confidence and minimum size)
-        # First round filtering: initial confidence threshold
-        init_thr = self.train_cfg.pseudo_label_initial_score_thr
-        if not isinstance(init_thr, float):
-            raise NotImplementedError("Dynamic initial threshold not supported yet, must be set to a fixed float")
+        # Retrieve and validate thresholds via the centralised helper.
+        # tau_h (pseudo_label_real_score_thr): HIGH-quality threshold.
+        #   Only teacher predictions with score >= tau_h are admitted as
+        #   supervised pseudo-labels for the student.
+        # tau_l (pseudo_label_initial_score_thr): LOW-quality threshold.
+        #   Coarse pre-filter; at the default value of 0.0 it is a no-op.
+        real_thr, init_thr = compute_quality_thresholds(self.train_cfg)
+        log_every_n(
+            f"[DML_ALOD] extract_teacher_info: tau_high={real_thr:.3f}, tau_low={init_thr:.3f}",
+            n=50,
+        )
+
+        # First round filtering: τ_l (low-quality / initial) threshold
         proposals, proposal_labels, _ = zip(*[
             filter_invalid(
                 bbox=prop,
@@ -954,10 +1014,8 @@ class DML_ALOD(MultiSteamDetector):
             for prop, label in zip(proposals, proposal_labels)
         ])
 
-        # Second round filtering: actual confidence threshold (filter by -thr after negation, equivalent to score >= thr)
-        real_thr = self.train_cfg.pseudo_label_real_score_thr
-        if not isinstance(real_thr, float):
-            raise NotImplementedError("Dynamic actual threshold not supported yet, must be set to a fixed float")
+        # Second round filtering: τ_h (high-quality / real) threshold
+        # Negation trick: score >= tau_h  ≡  (-score) < (-tau_h)  (strict >)
         proposals, proposal_labels, _ = zip(*[
             filter_invalid(
                 bbox=prop,
@@ -969,7 +1027,9 @@ class DML_ALOD(MultiSteamDetector):
             for prop, label in zip(proposals, proposal_labels)
         ])
 
-        # Third round filtering: final confidence threshold (ensure high-confidence pseudo-labels)
+        # Third round filtering: final exact τ_h guard (score > tau_h ensures
+        # only boxes with strictly positive high-quality score remain, removing
+        # any border-case boxes that squeezed through the negation step above).
         proposals, proposal_labels, _ = zip(*[
             filter_invalid(
                 bbox=prop,
